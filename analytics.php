@@ -36,6 +36,29 @@ $years = $pdo->query("SELECT DISTINCT YEAR(created_at) AS yr FROM tickets ORDER 
              ->fetchAll(PDO::FETCH_COLUMN);
 
 /* ── Métricas resumen (filtradas) ────────────────────────── */
+list($WTeam, $PTeam) = build_where_and_params($selYear, $selMonth, 't');
+
+$sqlByTeam = "
+    SELECT team_label, COUNT(*) AS cnt
+    FROM (
+        SELECT
+            ta.ticket_id,
+            COUNT(*) AS team_size,
+            GROUP_CONCAT(ta.username_snapshot ORDER BY ta.username_snapshot SEPARATOR ' + ') AS team_label
+        FROM ticket_attendees ta
+        INNER JOIN tickets t ON t.id = ta.ticket_id
+        $WTeam
+        GROUP BY ta.ticket_id
+        HAVING COUNT(*) BETWEEN 2 AND 3
+    ) q
+    GROUP BY team_label
+    ORDER BY cnt DESC
+    LIMIT 10
+";
+$stmt = $pdo->prepare($sqlByTeam);
+$stmt->execute($PTeam);
+$byTeam = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
 list($W, $P) = build_where_and_params($selYear, $selMonth, 'tickets');
 $sqlTot = "
   SELECT COUNT(*) total,
@@ -260,6 +283,14 @@ $badgeFiltro = ($selYear || $selMonth)
       </div>
     </div>
   </div>
+  <div class="col-lg-12">
+  <div class="card shadow-sm h-100">
+    <div class="card-body">
+      <h6 class="card-title">Tickets atendidos por equipo</h6>
+      <canvas id="cTeam" height="200"></canvas>
+    </div>
+  </div>
+</div>
 
   <script>
   // Datos desde PHP
@@ -274,6 +305,9 @@ $badgeFiltro = ($selYear || $selMonth)
 
   const userLabels = <?= json_encode(array_column($byUser,'usr'), JSON_UNESCAPED_UNICODE) ?>;
   const userValues = <?= json_encode(array_column($byUser,'cnt')) ?>;
+
+  const teamLabels = <?= json_encode(array_column($byTeam,'team_label'), JSON_UNESCAPED_UNICODE) ?>;
+  const teamValues = <?= json_encode(array_column($byTeam,'cnt')) ?>;
 
   // Trend (línea) – compacta
   new Chart(document.getElementById('cTrend'), {
@@ -316,6 +350,18 @@ $badgeFiltro = ($selYear || $selMonth)
       scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } }
     }
   });
+
+new Chart(document.getElementById('cTeam'), {
+  type: 'bar',
+  data: {
+    labels: teamLabels,
+    datasets: [{ data: teamValues }]
+  },
+  options: {
+    plugins: { legend: { display: false } },
+    scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+  }
+});
   </script>
 </body>
 </html>

@@ -17,8 +17,13 @@
 
 /*── 0. Sesión + conexión ──────────────────────────────────────────*/
 session_start();
-$role     = $_SESSION['role']     ?? 'guest';   // admin | user | guest
-$username = $_SESSION['username'] ?? '';
+if (empty($_SESSION['role']) || empty($_SESSION['username'])) {
+    header('Location: login.php');
+    exit;
+}
+
+$role     = $_SESSION['role'];
+$username = $_SESSION['username'];
 $pdo      = require __DIR__ . '/db.php';
 $errors = []; 
 $GUEST_CREATION_ONLY = ($role === 'guest');
@@ -38,12 +43,6 @@ unset($_SESSION['flash_success']);
 $flashTicket = $_SESSION['flash_ticket'] ?? null;
 unset($_SESSION['flash_ticket']);
 
-// Captcha aritmético para alta pública
-if (!isset($_SESSION['captcha_a'], $_SESSION['captcha_b'], $_SESSION['captcha_answer'])) {
-    $_SESSION['captcha_a'] = random_int(1, 9);
-    $_SESSION['captcha_b'] = random_int(1, 9);
-    $_SESSION['captcha_answer'] = $_SESSION['captcha_a'] + $_SESSION['captcha_b'];
-}
 
 
 /*── 1. Acciones rápidas (ack/done/del) ─────────────────────────*/
@@ -75,8 +74,101 @@ if ($role === 'admin' && isset($_GET['del'])) {
     header('Location: index.php'); exit;
 }
 
+if (in_array($role, ['admin','user']) && isset($_POST['done_ticket_id'])) {
+    $ticketId  = (int)($_POST['done_ticket_id'] ?? 0);
+    $attendees = array_map('intval', $_POST['attendees'] ?? []);
+    $attendees = array_values(array_unique(array_filter($attendees)));
+
+    if ($ticketId <= 0) {
+        $_SESSION['flash_success'] = 'Error: ticket inválido.';
+        header('Location: index.php#tickets');
+        exit;
+    }
+
+    if (count($attendees) < 1) {
+        $_SESSION['flash_success'] = 'Error: selecciona al menos una persona.';
+        header('Location: index.php#tickets');
+        exit;
+    }
+
+    if (count($attendees) > 3) {
+        $_SESSION['flash_success'] = 'Error: solo puedes seleccionar máximo 3 personas.';
+        header('Location: index.php#tickets');
+        exit;
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        $pdo->prepare("DELETE FROM ticket_attendees WHERE ticket_id = ?")
+            ->execute([$ticketId]);
+
+        $currentUserStmt = $pdo->prepare("SELECT id FROM users WHERE username = ? LIMIT 1");
+        $currentUserStmt->execute([$username]);
+        $currentUserId = (int)$currentUserStmt->fetchColumn();
+
+        if ($currentUserId > 0) {
+            $attendees = array_values(array_unique(array_merge([$currentUserId], $attendees)));
+            $attendees = array_slice($attendees, 0, 3);
+        }
+
+        $primaryUsername = '';
+
+        foreach ($attendees as $i => $userId) {
+            $stmtUser = $pdo->prepare("SELECT id, username FROM users WHERE id = ? LIMIT 1");
+            $stmtUser->execute([$userId]);
+            $userRow = $stmtUser->fetch(PDO::FETCH_ASSOC);
+
+            if (!$userRow) {
+                throw new RuntimeException('Uno de los usuarios seleccionados no existe.');
+            }
+
+            $isPrimary = ($i === 0) ? 1 : 0;
+
+            $pdo->prepare("
+                INSERT INTO ticket_attendees (ticket_id, user_id, username_snapshot, is_primary)
+                VALUES (?, ?, ?, ?)
+            ")->execute([
+                $ticketId,
+                (int)$userRow['id'],
+                $userRow['username'],
+                $isPrimary
+            ]);
+
+            if ($isPrimary) {
+                $primaryUsername = $userRow['username'];
+            }
+        }
+
+        $pdo->prepare("
+            UPDATE tickets
+               SET status = 'Atendido',
+                   attended_by = ?,
+                   attended_at = CURRENT_TIMESTAMP
+             WHERE id = ?
+        ")->execute([$primaryUsername, $ticketId]);
+
+        $pdo->commit();
+        $_SESSION['flash_success'] = '✅ Ticket marcado como atendido.';
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        $_SESSION['flash_success'] = 'Error: ' . $e->getMessage();
+    }
+
+    header('Location: index.php#tickets');
+    exit;
+}
+
 /*── 2. Alta de ticket (POST principal) ─────────────────────────*/
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && empty($_POST['immediate']) && !isset($_POST['folio_lookup'])) {
+if (
+    $_SERVER['REQUEST_METHOD'] === 'POST'
+    && empty($_POST['immediate'])
+    && !isset($_POST['folio_lookup'])
+    && !isset($_POST['name_lookup'])
+    && !isset($_POST['done_ticket_id'])
+) {
 
   /* Campos obligatorios -------------------------------------------------- */
   $labels = [
@@ -194,12 +286,7 @@ $aplicaLimite = (
 
 
 
-  if ($role === 'guest') {
-      $captchaAnswer = (int)($_POST['captcha_answer'] ?? -1);
-      if ($captchaAnswer !== (int)($_SESSION['captcha_answer'] ?? -999)) {
-          $errors[] = 'Captcha incorrecto. Verifica la suma e inténtalo nuevamente.';
-      }
-  }
+
 
   /* Insertar el ticket ---------------------------------------------------- */
   if (!$errors) {
@@ -226,9 +313,6 @@ $aplicaLimite = (
       // Flash para modal con folio real
       $ticketId = (int)$pdo->lastInsertId();
       $_SESSION['flash_ticket'] = [ 'id' => $ticketId ];
-      $_SESSION['captcha_a'] = random_int(1, 9);
-      $_SESSION['captcha_b'] = random_int(1, 9);
-      $_SESSION['captcha_answer'] = $_SESSION['captcha_a'] + $_SESSION['captcha_b'];
       // (Opcional) mantener mensaje genérico:
       // $_SESSION['flash_success'] = '✅ Ticket #'.$ticketId.' creado con éxito.';
 
@@ -302,9 +386,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
     /* ——— búsqueda por folio (tiene prioridad si viene) ——— */
     elseif ($folio !== '') {
         $stmt = $pdo->prepare("
-            SELECT id,status,attended_by,attended_at,created_at
-              FROM tickets
-             WHERE id = ?
+            SELECT
+                t.id,
+                t.status,
+                t.attended_by,
+                t.attended_at,
+                t.created_at,
+                (
+                  SELECT GROUP_CONCAT(ta.username_snapshot ORDER BY ta.is_primary DESC, ta.username_snapshot SEPARATOR ', ')
+                  FROM ticket_attendees ta
+                  WHERE ta.ticket_id = t.id
+                ) AS attended_team
+              FROM tickets t
+             WHERE t.id = ?
         ");
         $stmt->execute([(int)$folio]);
         $ticketLookup = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -313,10 +407,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST'
     /* ——— búsqueda por nombre (LIKE) ——— */
     else {
       $stmt = $pdo->prepare("
-      SELECT id,status,attended_by,created_at,description
-        FROM tickets
-       WHERE user_name LIKE ?
-    ORDER BY created_at DESC
+      SELECT
+        t.id,
+        t.status,
+        t.attended_by,
+        t.created_at,
+        t.description,
+        (
+          SELECT GROUP_CONCAT(ta.username_snapshot ORDER BY ta.is_primary DESC, ta.username_snapshot SEPARATOR ', ')
+          FROM ticket_attendees ta
+          WHERE ta.ticket_id = t.id
+        ) AS attended_team
+        FROM tickets t
+       WHERE t.user_name LIKE ?
+    ORDER BY t.created_at DESC
        LIMIT 50
   ");
         $stmt->execute(['%'.$name.'%']);
@@ -376,6 +480,13 @@ $equipmentTypes = [
 ];
 $brands = ['DELL','HP','LANIX','LENOVO', 'Smartbit', 'Cyberpower','Otra'];
 
+$ticketUsers = $pdo->query("
+    SELECT id, username
+      FROM users
+     WHERE role IN ('admin','user')
+     ORDER BY username ASC
+")->fetchAll(PDO::FETCH_ASSOC);
+
 /*── 6. Paginación muy simple ─────────────────────────────────*/
 $perPage = 10;                           // ← tickets por página
 $page    = max(1, (int)($_GET['p'] ?? 1));
@@ -387,16 +498,27 @@ $totalPages = ceil($totalRows / $perPage);
 
 /* tickets paginados */
 $stmt = $pdo->prepare("
-    SELECT id,user_name,direction,asset_number,
-           status,attended_by,created_at
-      FROM tickets
-  ORDER BY     
-  CASE status
+    SELECT
+        t.id,
+        t.user_name,
+        t.direction,
+        t.asset_number,
+        t.status,
+        t.attended_by,
+        t.created_at,
+        (
+          SELECT GROUP_CONCAT(ta.username_snapshot ORDER BY ta.is_primary DESC, ta.username_snapshot SEPARATOR ', ')
+          FROM ticket_attendees ta
+          WHERE ta.ticket_id = t.id
+        ) AS attended_team
+      FROM tickets t
+  ORDER BY
+  CASE t.status
   WHEN 'En camino' THEN 0      -- 1ª prioridad
   WHEN 'Pendiente'  THEN 1      -- 2ª prioridad
   ELSE 2                        -- Atendido
 END,
-id DESC                         -- dentro de cada grupo, folio más alto primeros
+t.id DESC                         -- dentro de cada grupo, folio más alto primeros
 LIMIT :lim OFFSET :off
 ");
 $stmt->bindValue(':lim',  $perPage, PDO::PARAM_INT);
@@ -412,7 +534,7 @@ $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
-  <link href="styles.css" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css?v=<?= filemtime(__DIR__ . '/styles.css') ?>">
   <link rel="shortcut icon" href="siti_logo.ico">
   <!-- favicon estándar -->
   <link rel="icon" type="image/x-icon" href="siti_logo.ico">
@@ -551,6 +673,43 @@ $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
         <button type="button" class="btn btn-success" onclick="window.print()">Imprimir</button>
         <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cerrar</button>
       </div>
+    </div>
+  </div>
+</div>
+<?php endif; ?>
+
+<?php if ($role!=='guest'): ?>
+<div class="modal fade" id="modalDoneTeam" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content shadow">
+      <form method="post" action="index.php#tickets">
+        <div class="modal-header">
+          <h5 class="modal-title">Registrar equipo de atención</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Cerrar"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" name="done_ticket_id" id="done_ticket_id">
+
+          <div class="mb-3">
+            <div class="text-muted small">Ticket</div>
+            <div class="fw-semibold" id="done_ticket_label">#</div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label">Usuarios que atendieron</label>
+            <select name="attendees[]" id="done_attendees" class="form-select" multiple size="8" required>
+              <?php foreach ($ticketUsers as $u): ?>
+                <option value="<?= (int)$u['id'] ?>"><?= htmlspecialchars($u['username']) ?></option>
+              <?php endforeach; ?>
+            </select>
+            <div class="form-text">Selecciona hasta 3 personas. Tu usuario aparecerá preseleccionado.</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-success">Guardar y marcar atendido</button>
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancelar</button>
+        </div>
+      </form>
     </div>
   </div>
 </div>
@@ -821,15 +980,15 @@ $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
       <textarea class="form-control" name="description" rows="4" required><?= htmlspecialchars($_POST['description'] ?? '') ?></textarea>
     </div>
     <?php if ($role === 'guest'): ?>
-    <div class="col-md-4">
+   <!-- <div class="col-md-4">
       <label class="form-label">Captcha</label>
       <input class="form-control" value="<?= (int)($_SESSION['captcha_a'] ?? 0) ?> + <?= (int)($_SESSION['captcha_b'] ?? 0) ?>" readonly>
-    </div>
+    </div
     <div class="col-md-4">
       <label class="form-label">Resultado</label>
       <input class="form-control" name="captcha_answer" inputmode="numeric" required
              value="<?= htmlspecialchars($_POST['captcha_answer'] ?? '') ?>">
-    </div>
+    </div-->
     <?php endif; ?>
     <div class="col-12">
       <button class="btn btn-primary" type="submit">Enviar ticket</button>
@@ -868,7 +1027,7 @@ $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
     Folio <strong>#<?= $ticketLookup['id'] ?></strong><br>
     Estado: <strong><?= $ticketLookup['status'] ?></strong>
     <?php if ($ticketLookup['attended_by']): ?>
-      <br>Atendido por: <strong><?= htmlspecialchars($ticketLookup['attended_by']) ?></strong>
+      <br>Atendido por: <strong><?= htmlspecialchars($ticketLookup['attended_team'] ?: ($ticketLookup['attended_by'] ?? '')) ?></strong>
     <?php endif; ?>
     <?php if ($ticketLookup['attended_at']): ?>
       <br>Fecha y hora de atención: <strong><?= $ticketLookup['attended_at'] ?></strong>
@@ -893,7 +1052,7 @@ $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
       <tr>
         <td><?= $t['id'] ?></td>
         <td><?= $t['status'] ?></td>
-        <td><?= htmlspecialchars($t['attended_by'] ?? '') ?></td>
+        <td><?= htmlspecialchars($t['attended_team'] ?: ($t['attended_by'] ?? '')) ?></td>
         <td><?= $t['created_at'] ?></td>
         <td><?= htmlspecialchars($t['description']) ?></td>
       </tr>
@@ -932,18 +1091,30 @@ $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
 <td>
   <?php if ($t['status']==='Pendiente' && $role!=='guest'): ?>
       <a href="?ack=<?= $t['id'] ?>"  class="btn btn-sm btn-outline-warning me-1">🚶‍♂️</a>
-      <a href="?done=<?= $t['id'] ?>" class="btn btn-sm btn-outline-success">✔</a>
+      <button type="button"
+              class="btn btn-sm btn-outline-success btn-done-team"
+              data-bs-toggle="modal"
+              data-bs-target="#modalDoneTeam"
+              data-ticket-id="<?= (int)$t['id'] ?>"
+              data-ticket-folio="<?= (int)$t['id'] ?>"
+              data-ticket-user="<?= htmlspecialchars($t['user_name'], ENT_QUOTES) ?>">✔</button>
 
   <?php elseif ($t['status']==='En camino' && $role!=='guest'): ?>
       <span class="badge bg-warning text-dark me-1">En&nbsp;camino</span>
-      <a href="?done=<?= $t['id'] ?>" class="btn btn-sm btn-outline-success">✔</a>
+      <button type="button"
+              class="btn btn-sm btn-outline-success btn-done-team"
+              data-bs-toggle="modal"
+              data-bs-target="#modalDoneTeam"
+              data-ticket-id="<?= (int)$t['id'] ?>"
+              data-ticket-folio="<?= (int)$t['id'] ?>"
+              data-ticket-user="<?= htmlspecialchars($t['user_name'], ENT_QUOTES) ?>">✔</button>
 
   <?php else: ?>
       <span class="badge bg-success">Atendido</span>
   <?php endif; ?>
 </td>
 
-        <td><?= htmlspecialchars($t['attended_by'] ?? '') ?></td>
+        <td><?= htmlspecialchars($t['attended_team'] ?: ($t['attended_by'] ?? '')) ?></td>
         <td><?= $t['created_at'] ?></td>
         <td><a href="ticket_view.php?id=<?= $t['id'] ?>" class="btn btn-sm btn-info">👁</a></td>
         <td>
@@ -1108,6 +1279,36 @@ if (quickSelDir) {
     quickSelDep.disabled=false;
   });
 }
+</script>
+
+<script>
+const currentUsername = <?= json_encode($username, JSON_UNESCAPED_UNICODE) ?>;
+
+document.querySelectorAll('.btn-done-team').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const ticketId    = btn.dataset.ticketId || '';
+    const ticketFolio = btn.dataset.ticketFolio || '';
+    const ticketUser  = btn.dataset.ticketUser || '';
+
+    document.getElementById('done_ticket_id').value = ticketId;
+    document.getElementById('done_ticket_label').textContent = `#${ticketFolio} · ${ticketUser}`;
+
+    const select = document.getElementById('done_attendees');
+    if (!select) return;
+
+    [...select.options].forEach(opt => {
+      opt.selected = (opt.textContent.trim() === currentUsername);
+    });
+  });
+});
+
+document.getElementById('done_attendees')?.addEventListener('change', function () {
+  const selected = [...this.selectedOptions];
+  if (selected.length > 3) {
+    selected[selected.length - 1].selected = false;
+    alert('Solo puedes seleccionar máximo 3 personas.');
+  }
+});
 </script>
 
 <?php if (!empty($flashTicket)): ?>

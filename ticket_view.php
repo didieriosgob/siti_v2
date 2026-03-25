@@ -24,6 +24,71 @@ if (!$ticket) {
     http_response_code(404);
 }
 function h($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+$users = $pdo->query("
+    SELECT id, username
+    FROM users
+    WHERE role IN ('admin','user')
+    ORDER BY username
+")->fetchAll(PDO::FETCH_ASSOC);
+
+$teamStmt = $pdo->prepare("
+    SELECT ta.user_id, ta.username_snapshot, ta.is_primary
+    FROM ticket_attendees ta
+    WHERE ta.ticket_id = ?
+    ORDER BY ta.is_primary DESC, ta.username_snapshot ASC
+");
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_team'])) {
+    $selected = array_map('intval', $_POST['attendees'] ?? []);
+    $selected = array_values(array_unique(array_filter($selected)));
+
+    if (count($selected) < 1) {
+        $error = 'Debes seleccionar al menos una persona.';
+    } elseif (count($selected) > 3) {
+        $error = 'Solo se permiten máximo 3 personas por ticket.';
+    } else {
+        $pdo->beginTransaction();
+        try {
+            $pdo->prepare("DELETE FROM ticket_attendees WHERE ticket_id = ?")->execute([$id]);
+
+            $primaryUsername = null;
+
+            foreach ($selected as $index => $userId) {
+                $uStmt = $pdo->prepare("SELECT username FROM users WHERE id = ? LIMIT 1");
+                $uStmt->execute([$userId]);
+                $uName = $uStmt->fetchColumn();
+
+                if (!$uName) {
+                    throw new RuntimeException('Uno de los usuarios seleccionados no existe.');
+                }
+
+                $pdo->prepare("
+                    INSERT INTO ticket_attendees (ticket_id, user_id, username_snapshot, is_primary)
+                    VALUES (?, ?, ?, ?)
+                ")->execute([$id, $userId, $uName, $index === 0 ? 1 : 0]);
+
+                if ($index === 0) {
+                    $primaryUsername = $uName;
+                }
+            }
+
+            $pdo->prepare("
+                UPDATE tickets
+                   SET attended_by = ?
+                 WHERE id = ?
+            ")->execute([$primaryUsername, $id]);
+
+            $pdo->commit();
+            header("Location: ticket_view.php?id=".$id);
+            exit;
+        } catch (Throwable $e) {
+            $pdo->rollBack();
+            $error = $e->getMessage();
+        }
+    }
+}
+$teamStmt->execute([$id]);
+$team = $teamStmt->fetchAll(PDO::FETCH_ASSOC);
+$currentTeamIds = array_map(fn($r) => (int)$r['user_id'], $team);
 ?>
 <!doctype html>
 <html lang="es">
@@ -78,10 +143,52 @@ function h($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
       </div>
 
       <hr class="my-4">
+<div class="mt-4">
+  <h2 class="h5">Equipo de atención</h2>
 
+  <?php if (!empty($error)): ?>
+    <div class="alert alert-danger"><?= h($error) ?></div>
+  <?php endif; ?>
+
+  <form method="post" class="row g-3">
+    <div class="col-12">
+      <label class="form-label">Selecciona hasta 3 usuarios</label>
+      <select name="attendees[]" class="form-select" multiple size="8" required>
+        <?php foreach ($users as $u): ?>
+          <option value="<?= (int)$u['id'] ?>" <?= in_array((int)$u['id'], $currentTeamIds, true) ? 'selected' : '' ?>>
+            <?= h($u['username']) ?>
+          </option>
+        <?php endforeach; ?>
+      </select>
+      <div class="form-text">El primero de la lista quedará como responsable principal.</div>
+    </div>
+    <div class="col-12">
+      <button type="submit" name="save_team" value="1" class="btn btn-primary">
+        Guardar equipo
+      </button>
+    </div>
+  </form>
+
+  <?php if ($team): ?>
+    <div class="mt-3">
+      <?php foreach ($team as $member): ?>
+        <span class="badge bg-secondary me-1">
+          <?= h($member['username_snapshot']) ?><?= $member['is_primary'] ? ' · principal' : '' ?>
+        </span>
+      <?php endforeach; ?>
+    </div>
+  <?php endif; ?>
+</div>
       <div class="row g-3">
         <div class="col-md-4"><strong>Estatus actual:</strong><br><?= h($ticket['status']) ?></div>
-        <div class="col-md-4"><strong>Atendido por:</strong><br><?= h($ticket['attended_by'] ?: 'Sin asignar') ?></div>
+        <div class="col-md-12">
+          <strong>Atendido por:</strong><br>
+          <?php if ($team): ?>
+            <?= h(implode(', ', array_column($team, 'username_snapshot'))) ?>
+          <?php else: ?>
+            <span class="text-muted">Sin asignar</span>
+          <?php endif; ?>
+        </div>
         <div class="col-md-4"><strong>Fecha de atención:</strong><br><?= h($ticket['attended_at'] ?: 'Pendiente') ?></div>
       </div>
 
